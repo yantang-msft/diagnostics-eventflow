@@ -31,6 +31,10 @@
     <ProjectReference Include="..\Microsoft.Diagnostics.EventFlow.Core\Microsoft.Diagnostics.EventFlow.Core.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <Folder Include="Properties\" />
+  </ItemGroup>
+
   <Target Name="BuildProtocolBuffer" BeforeTargets="BeforeBuild">
     <Exec Command="protoc.exe --csharp_out=.\ metrics.proto" />
   </Target>

@@ -1,5 +1,11 @@
-﻿using Io.Prometheus.Client;
+﻿// ------------------------------------------------------------
+//  Copyright (c) Microsoft Corporation.  All rights reserved.
+//  Licensed under the MIT License (MIT). See License.txt in the repo root for license information.
+// ------------------------------------------------------------
+
+using Io.Prometheus.Client;
 using Microsoft.Diagnostics.EventFlow.Configuration;
+using Microsoft.Diagnostics.EventFlow.Inputs.Prometheus;
 using Microsoft.Diagnostics.EventFlow.Metadata;
 using Microsoft.Extensions.Configuration;
 using System;
@@ -81,9 +87,9 @@ namespace Microsoft.Diagnostics.EventFlow.Inputs
 
             var requestTime = DateTimeOffset.UtcNow;
             var response = await client.GetAsync(url);
+            var stream = await response.Content.ReadAsStreamAsync();
             if (response.Content.Headers.ContentType.MediaType == "application/vnd.google.protobuf")
             {
-                var stream = await response.Content.ReadAsStreamAsync();
                 while (stream.Position < stream.Length)
                 {
                     MetricFamily mf = MetricFamily.Parser.ParseDelimitedFrom(stream);
@@ -95,7 +101,14 @@ namespace Microsoft.Diagnostics.EventFlow.Inputs
             }
             else
             {
-                // TODO: parse plain text format
+                var parser = new TextParser(stream);
+                foreach(var mf in parser.GetMetricFamilies())
+                {
+                    foreach (var eventData in ConvertToEventData(mf, url, requestTime))
+                    {
+                        this.subject.OnNext(eventData);
+                    }
+                }
             }
 
             return;
@@ -135,7 +148,7 @@ namespace Microsoft.Diagnostics.EventFlow.Inputs
                     case MetricType.Untyped:
                         metricMetadata.Properties[MetricData.MetricValueMoniker] = metric.Untyped.Value.ToString();
                         break;
-                    case MetricType.Histogram:  // TODO: Support aggregation in metric metadata
+                    case MetricType.Histogram:  // TODO: Support aggregation in metric metadata, i.e., Sum, Count, MinValue, MaxValue, so AI can use the aggregated value
                         metricMetadata.Properties[MetricData.MetricValueMoniker] = "0";
                         data.Payload["Count"] = metric.Histogram.SampleCount;
                         data.Payload["Sum"] = metric.Histogram.SampleSum;

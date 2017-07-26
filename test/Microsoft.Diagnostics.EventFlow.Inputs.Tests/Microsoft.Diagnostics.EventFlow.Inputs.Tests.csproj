@@ -14,6 +14,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\..\src\Microsoft.Diagnostics.EventFlow.Inputs.Prometheus\Microsoft.Diagnostics.EventFlow.Inputs.Prometheus.csproj" />
     <ProjectReference Include="..\TestHelpers\TestHelpers.csproj" />
     <ProjectReference Include="..\..\src\Microsoft.Diagnostics.EventFlow.Core\Microsoft.Diagnostics.EventFlow.Core.csproj" />
     <ProjectReference Include="..\..\src\Microsoft.Diagnostics.EventFlow.EtwUtilities\Microsoft.Diagnostics.EventFlow.EtwUtilities.csproj" />
