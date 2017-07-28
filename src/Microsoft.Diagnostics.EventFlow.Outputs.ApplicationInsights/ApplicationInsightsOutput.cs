@@ -91,7 +91,11 @@ namespace Microsoft.Diagnostics.EventFlow.Outputs
 
                     if (e.TryGetMetadata(MetricData.MetricMetadataKind, out metadata))
                     {
-                        tracked = TrackMetric(e, metadata);
+                        tracked = TrackSingleValueMetric(e, metadata);
+                    }
+                    else if (e.TryGetMetadata(AggregatedMetricData.MetricMetadataKind, out metadata))
+                    {
+                        tracked = TrackAggregatedMetric(e, metadata);
                     }
                     else if (e.TryGetMetadata(RequestData.RequestMetadataKind, out metadata))
                     {
@@ -156,7 +160,7 @@ namespace Microsoft.Diagnostics.EventFlow.Outputs
             }
         }
 
-        private bool TrackMetric(EventData e, IReadOnlyCollection<EventMetadata> metadata)
+        private bool TrackSingleValueMetric(EventData e, IReadOnlyCollection<EventMetadata> metadata)
         {
             Debug.Assert(metadata != null);
             bool tracked = false;
@@ -173,6 +177,32 @@ namespace Microsoft.Diagnostics.EventFlow.Outputs
                 MetricTelemetry mt = new MetricTelemetry();
                 mt.Name = metricData.MetricName;
                 mt.Sum = metricData.Value;
+                AddProperties(mt, e);
+                telemetryClient.TrackMetric(mt);
+                tracked = true;
+            }
+
+            return tracked;
+        }
+
+        private bool TrackAggregatedMetric(EventData e, IReadOnlyCollection<EventMetadata> metadata)
+        {
+            Debug.Assert(metadata != null);
+            bool tracked = false;
+
+            foreach (EventMetadata metricMetadata in metadata)
+            {
+                var result = AggregatedMetricData.TryGetData(e, metricMetadata, out AggregatedMetricData aggregatedMetricData);
+                if (result.Status != DataRetrievalStatus.Success)
+                {
+                    this.healthReporter.ReportWarning("ApplicationInsightsOutput: " + result.Message, EventFlowContextIdentifiers.Output);
+                    continue;
+                }
+
+                MetricTelemetry mt = new MetricTelemetry();
+                mt.Name = aggregatedMetricData.MetricName;
+                mt.Sum = aggregatedMetricData.Sum;
+                mt.Count = aggregatedMetricData.Count;
                 AddProperties(mt, e);
                 telemetryClient.TrackMetric(mt);
                 tracked = true;

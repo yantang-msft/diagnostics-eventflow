@@ -9,8 +9,11 @@ using Microsoft.Diagnostics.EventFlow.Inputs.Prometheus;
 using Microsoft.Diagnostics.EventFlow.Metadata;
 using Microsoft.Extensions.Configuration;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Linq;
 using System.Net.Http;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Validation;
@@ -23,7 +26,12 @@ namespace Microsoft.Diagnostics.EventFlow.Inputs
         private EventFlowSubject<EventData> subject;
         private IHealthReporter healthReporter;
         private bool disposed = false;
-        private Timer timer;
+        private CancellationTokenSource cancellationTokenSource;
+
+        // The summary and histogram metric is aggregated since the start of a program.
+        // To get the aggregated value during the scrape interval period, we need to remember the last metric and calculate the difference.
+        private ConcurrentDictionary<string, Metric> lastSummaryMetricDict;
+        private ConcurrentDictionary<string, Metric> lastHistogramMetricDict;
 
         public PrometheusInput(IConfiguration configuration, IHealthReporter healthReporter)
         {
@@ -53,8 +61,8 @@ namespace Microsoft.Diagnostics.EventFlow.Inputs
                     if (!this.disposed)
                     {
                         this.disposed = true;
+                        this.cancellationTokenSource.Cancel();
                         this.subject.Dispose();
-                        timer.Dispose();
                     }
                 }
             }
@@ -69,20 +77,34 @@ namespace Microsoft.Diagnostics.EventFlow.Inputs
         {
             this.healthReporter = healthReporter;
             this.subject = new EventFlowSubject<EventData>();
+            this.cancellationTokenSource = new CancellationTokenSource();
+            this.lastHistogramMetricDict = new ConcurrentDictionary<string, Metric>();
+            this.lastSummaryMetricDict = new ConcurrentDictionary<string, Metric>();
 
-            this.timer = new Timer(_ =>
+            foreach (var url in configuration.Urls)
             {
-                foreach (var url in configuration.Urls)
+                Task.Run(async () =>
                 {
-                    Task.Run(() => GetMetricFromUrl(url));
-                }
-            }, null, 0, configuration.ScrapeIntervalMsec);
+                    while (!this.cancellationTokenSource.IsCancellationRequested)
+                    {
+                        var nextStartTime = DateTime.Now.AddMilliseconds(configuration.ScrapeIntervalMsec);
+                        await GetMetricFromUrl(url);
+                        var endTime = DateTime.Now;
+
+                        if (endTime < nextStartTime)
+                        {
+                            await Task.Delay(nextStartTime - endTime);
+                        }
+                    }
+                });
+            };
         }
 
-        private async void GetMetricFromUrl(string url)
+        private async Task GetMetricFromUrl(string url)
         {
             var client = new HttpClient();
             client.DefaultRequestHeaders.Add("Accept", "application/vnd.google.protobuf;proto=io.prometheus.client.MetricFamily;encoding=delimited;q=0.7,text/plain;version=0.0.4;q=0.3");
+            //client.DefaultRequestHeaders.Add("Accept", "text/plain;version=0.0.4;q=0.3");
             // TODO: Add authentication
 
             var requestTime = DateTimeOffset.UtcNow;
@@ -110,8 +132,6 @@ namespace Microsoft.Diagnostics.EventFlow.Inputs
                     }
                 }
             }
-
-            return;
         }
 
         private IEnumerable<EventData> ConvertToEventData(MetricFamily mf, string url, DateTimeOffset requestTime)
@@ -126,10 +146,6 @@ namespace Microsoft.Diagnostics.EventFlow.Inputs
                     Timestamp = metric.TimestampMs != 0 ? PrometheusInput.Epoch.AddMilliseconds(metric.TimestampMs) : requestTime,
                 };
 
-                // General metric properties: Name, Type, Labels
-                var metricMetadata = new EventMetadata(MetricData.MetricMetadataKind);
-                metricMetadata.Properties[MetricData.MetricNameMoniker] = mf.Name;
-
                 data.Payload["Type"] = mf.Type.ToString();
                 foreach (var label in metric.Label)
                 {
@@ -137,42 +153,113 @@ namespace Microsoft.Diagnostics.EventFlow.Inputs
                 }
 
                 // Special handling on different metric types
+                EventMetadata metricMetadata = null;
                 switch (mf.Type)
                 {
                     case MetricType.Counter:
-                        metricMetadata.Properties[MetricData.MetricValueMoniker] = metric.Counter.Value.ToString();
+                        metricMetadata = GetSingleValueMetricMetadata(mf.Name, metric.Counter.Value.ToString());
                         break;
                     case MetricType.Gauge:
-                        metricMetadata.Properties[MetricData.MetricValueMoniker] = metric.Gauge.Value.ToString();
+                        metricMetadata = GetSingleValueMetricMetadata(mf.Name, metric.Gauge.Value.ToString());
                         break;
                     case MetricType.Untyped:
-                        metricMetadata.Properties[MetricData.MetricValueMoniker] = metric.Untyped.Value.ToString();
+                        metricMetadata = GetSingleValueMetricMetadata(mf.Name, metric.Untyped.Value.ToString());
                         break;
-                    case MetricType.Histogram:  // TODO: Support aggregation in metric metadata, i.e., Sum, Count, MinValue, MaxValue, so AI can use the aggregated value
-                        metricMetadata.Properties[MetricData.MetricValueMoniker] = "0";
-                        data.Payload["Count"] = metric.Histogram.SampleCount;
-                        data.Payload["Sum"] = metric.Histogram.SampleSum;
+                    case MetricType.Histogram:
+                        metricMetadata = GetHistogramMetricMetadata(url, mf.Name, metric);
                         foreach (var bucket in metric.Histogram.Bucket)
                         {
                             data.Payload["bucket_" + bucket.UpperBound] = bucket.CumulativeCount;
                         }
                         break;
                     case MetricType.Summary:
-                        metricMetadata.Properties[MetricData.MetricValueMoniker] = "0";
-                        data.Payload["Count"] = metric.Summary.SampleCount;
-                        data.Payload["Sum"] = metric.Summary.SampleSum;
+                        metricMetadata = GetSummaryMetricMetadata(url, mf.Name, metric);
                         foreach (var quantile in metric.Summary.Quantile)
                         {
                             data.Payload["quantile_" + quantile.Quantile_] = quantile.Value;
                         }
                         break;
                 }
-                data.SetMetadata(metricMetadata);
 
-                result.Add(data);
+                // First sample of Histogram and Summary metric will be ignored
+                if (metricMetadata != null)
+                {
+                    data.SetMetadata(metricMetadata);
+                    result.Add(data);
+                }
             }
 
             return result;
+        }
+
+        private EventMetadata GetSingleValueMetricMetadata(string metricName, string metricValue)
+        {
+            var metricMetadata = new EventMetadata(MetricData.MetricMetadataKind);
+            metricMetadata.Properties[MetricData.MetricNameMoniker] = metricName;
+            metricMetadata.Properties[MetricData.MetricValueMoniker] = metricValue;
+
+            return metricMetadata;
+        }
+
+        private EventMetadata GetHistogramMetricMetadata(string url, string metricName, Metric metric)
+        {
+            var key = GenerateKeyForMetricDict(url, metricName, metric);
+            if (!lastHistogramMetricDict.ContainsKey(key))
+            {
+                // This is the first sample, just ignore
+                lastHistogramMetricDict[key] = metric;
+                return null;
+            }
+            else
+            {
+                var lastMetric = lastHistogramMetricDict[key];
+                var metricMetadata = new EventMetadata(AggregatedMetricData.MetricMetadataKind);
+                metricMetadata.Properties[AggregatedMetricData.MetricNameMoniker] = metricName;
+                metricMetadata.Properties[AggregatedMetricData.MetricSumMoniker] = (metric.Histogram.SampleSum - lastMetric.Histogram.SampleSum).ToString();
+                metricMetadata.Properties[AggregatedMetricData.MetricCountMoniker] = (metric.Histogram.SampleCount - lastMetric.Histogram.SampleCount).ToString();
+
+                lastHistogramMetricDict[key] = metric;
+
+                return metricMetadata;
+            }
+        }
+
+        private EventMetadata GetSummaryMetricMetadata(string url, string metricName, Metric metric)
+        {
+            var key = GenerateKeyForMetricDict(url, metricName, metric);
+            if (!lastSummaryMetricDict.ContainsKey(key))
+            {
+                // This is the first sample, just ignore
+                lastSummaryMetricDict[key] = metric;
+                return null;
+            }
+            else
+            {
+                var lastMetric = lastSummaryMetricDict[key];
+                var metricMetadata = new EventMetadata(AggregatedMetricData.MetricMetadataKind);
+                metricMetadata.Properties[AggregatedMetricData.MetricNameMoniker] = metricName;
+                metricMetadata.Properties[AggregatedMetricData.MetricSumMoniker] = (metric.Summary.SampleSum - lastMetric.Summary.SampleSum).ToString();
+                metricMetadata.Properties[AggregatedMetricData.MetricCountMoniker] = (metric.Summary.SampleCount - lastMetric.Summary.SampleCount).ToString();
+
+                lastSummaryMetricDict[key] = metric;
+
+                return metricMetadata;
+            }
+        }
+
+        private string GenerateKeyForMetricDict(string url, string metricName, Metric metric)
+        {
+            var sb = new StringBuilder();
+            sb.Append(url);
+            sb.Append(";" + metricName);
+
+            var orderedLabel = metric.Label.OrderBy(label => label.Name);
+            foreach (var label in orderedLabel)
+            {
+                sb.Append(";" + label.Name + ":" + label.Value);
+            }
+
+            return sb.ToString();
         }
     }
 }
